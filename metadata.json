@@ -1,0 +1,6 @@
+{
+  "name": "RATBV Portal Ghișeu",
+  "description": "Portal dedicat personalului de la ghișeele RATBV pentru scanarea și validarea codurilor QR acordate călătorilor pentru 3 călătorii gratuite.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
