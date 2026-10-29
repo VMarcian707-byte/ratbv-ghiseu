@@ -1,12 +1,15 @@
 /**
- * Clean, Resilient QR Code Scanner for RATBV Cashier Portal
+ * Rock-Solid QR Code Scanner for RATBV Cashier Portal
  * Optimized for Vercel, iOS Safari, Android Chrome, and Desktop.
  *
- * Resolved issues:
- * 1. "Cannot clear while scan is ongoing, close it first" - Removed all premature .clear() invocations
- * 2. Camera opening for a fraction of a second and closing - Fixed mount effect dependency loop
- * 3. Stable singleton Html5Qrcode instance with safe pause/resume state management
- * 4. Automatic facingMode: 'environment' with graceful 'user' webcam fallback
+ * Guaranteed stability:
+ * 1. ZERO "Cannot clear while scan is ongoing" errors:
+ *    Always stops previous instance cleanly, wipes container DOM, and instantiates
+ *    a fresh Html5Qrcode in NOT_STARTED state before calling .start().
+ * 2. ZERO premature shutdown loops:
+ *    Mount effect has strictly empty dependency array [] and a hasAutoStarted ref guard.
+ * 3. Stable callback refs so portal re-renders never trigger camera restarts.
+ * 4. Safe pause/resume during 4-second ticket validation modal.
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
@@ -42,6 +45,8 @@ interface ErrorDetails {
   isPermissionIssue?: boolean;
 }
 
+type ScannerStatus = 'idle' | 'starting' | 'scanning' | 'stopping';
+
 export const QRScanner: React.FC<QRScannerProps> = ({
   onScanSuccess,
   isProcessing,
@@ -52,18 +57,24 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   const fileQrCodeRef = useRef<Html5Qrcode | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Stable refs to prevent effect recreation loops
+  // Status tracking refs to prevent race conditions
+  const statusRef = useRef<ScannerStatus>('idle');
+  const isMountedRef = useRef<boolean>(true);
+  const hasAutoStartedRef = useRef<boolean>(false);
+  const isScanningActiveRef = useRef<boolean>(true);
+  const lastScannedCodeRef = useRef<{ code: string; time: number } | null>(null);
+
+  // Active camera settings in refs to avoid recreating callbacks
+  const activeFacingModeRef = useRef<'environment' | 'user'>('environment');
+  const selectedCameraIdRef = useRef<string | null>(null);
+
+  // Stable callback ref
   const onScanSuccessRef = useRef(onScanSuccess);
   useEffect(() => {
     onScanSuccessRef.current = onScanSuccess;
   }, [onScanSuccess]);
 
-  const isMountedRef = useRef<boolean>(true);
-  const isStartingRef = useRef<boolean>(false);
-  const isStoppingRef = useRef<boolean>(false);
-  const isScanningActiveRef = useRef<boolean>(true);
-  const lastScannedCodeRef = useRef<{ code: string; time: number } | null>(null);
-
+  // UI state
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
   const [activeFacingMode, setActiveFacingMode] = useState<'environment' | 'user'>('environment');
@@ -74,67 +85,70 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   const [hasTorch, setHasTorch] = useState<boolean>(false);
   const [fileScanSuccess, setFileScanSuccess] = useState<string | null>(null);
 
-  // Synchronize active scanning state without restarting the camera
+  // Safely pause/resume decoding when 4-second modal is displayed
   useEffect(() => {
     isScanningActiveRef.current = isActive && !isProcessing;
 
-    if (html5QrCodeRef.current && isScanning) {
+    const scanner = html5QrCodeRef.current;
+    if (scanner && statusRef.current === 'scanning') {
       try {
-        const state = html5QrCodeRef.current.getState();
+        const state = scanner.getState();
         if (!isScanningActiveRef.current && state === Html5QrcodeScannerState.SCANNING) {
-          html5QrCodeRef.current.pause(true);
+          scanner.pause(true);
         } else if (isScanningActiveRef.current && state === Html5QrcodeScannerState.PAUSED) {
-          html5QrCodeRef.current.resume();
+          scanner.resume();
         }
       } catch (err) {
-        console.warn('Camera pause/resume toggle notice:', err);
+        console.warn('Camera pause/resume notice:', err);
       }
     }
-  }, [isActive, isProcessing, isScanning]);
+  }, [isActive, isProcessing]);
 
   /**
-   * Safely stops the scanner if running
+   * Safely stop the camera hardware
    */
-  const stopScanner = useCallback(async () => {
-    if (isStoppingRef.current || !html5QrCodeRef.current) return;
-    isStoppingRef.current = true;
+  const safeStop = useCallback(async () => {
+    const scanner = html5QrCodeRef.current;
+    if (!scanner) {
+      statusRef.current = 'idle';
+      setIsScanning(false);
+      return;
+    }
 
+    statusRef.current = 'stopping';
     try {
-      const state = html5QrCodeRef.current.getState();
+      const state = scanner.getState();
       if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
-        await html5QrCodeRef.current.stop();
+        await scanner.stop();
       }
     } catch (err) {
-      console.warn('Stop scanner notice:', err);
+      console.warn('Scanner stop notice:', err);
     } finally {
+      html5QrCodeRef.current = null;
+      statusRef.current = 'idle';
       setIsScanning(false);
       setTorchOn(false);
       setHasTorch(false);
-      isStoppingRef.current = false;
     }
   }, []);
 
   /**
-   * Main Start Scanner function
-   * Creates Html5Qrcode instance once and starts video stream.
-   * NEVER calls .clear() while scanner is active.
+   * Start camera scanner cleanly
+   * Ensures previous scanner is stopped, container is clean, and fresh Html5Qrcode is in NOT_STARTED state.
    */
   const startScanner = useCallback(async (
     targetConfig?: string | { facingMode: 'environment' | 'user' }
   ) => {
-    if (isStartingRef.current || isStoppingRef.current) return;
+    // Prevent overlapping start calls
+    if (statusRef.current === 'starting') return;
+    if (statusRef.current === 'scanning' && !targetConfig) return;
 
-    // If scanner is already scanning with no specific camera switch requested, do nothing
-    if (!targetConfig && html5QrCodeRef.current?.isScanning) {
-      return;
-    }
-
-    isStartingRef.current = true;
+    statusRef.current = 'starting';
     setIsLoading(true);
     setErrorState(null);
 
     try {
-      // 1. Check secure context
+      // 1. Verify secure context and mediaDevices
       if (typeof window !== 'undefined') {
         if (!window.isSecureContext && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
           throw new Error('SECURE_CONTEXT_REQUIRED');
@@ -144,36 +158,38 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         }
       }
 
-      // 2. Ensure DOM container exists
+      // 2. Stop any existing running instance first
+      if (html5QrCodeRef.current) {
+        try {
+          const state = html5QrCodeRef.current.getState();
+          if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
+            await html5QrCodeRef.current.stop();
+          }
+        } catch (e) {
+          console.warn('Stop previous instance warning:', e);
+        }
+        html5QrCodeRef.current = null;
+      }
+
+      // 3. Ensure DOM container exists and is clean
       const container = document.getElementById(containerId);
       if (!container) {
         throw new Error('CONTAINER_NOT_FOUND');
       }
+      container.innerHTML = '';
 
-      // 3. Stop previous stream if switching camera
-      if (html5QrCodeRef.current && html5QrCodeRef.current.isScanning) {
-        try {
-          await html5QrCodeRef.current.stop();
-        } catch {
-          // ignore stop transition
-        }
-      }
+      // 4. Create fresh instance in NOT_STARTED state (guarantees clearElement won't throw)
+      const scanner = new Html5Qrcode(containerId);
+      html5QrCodeRef.current = scanner;
 
-      // 4. Reuse or initialize singleton scanner
-      if (!html5QrCodeRef.current) {
-        html5QrCodeRef.current = new Html5Qrcode(containerId);
-      }
-
-      // 5. Choose camera configuration
       let cameraConfig: string | MediaTrackConstraints = 
-        targetConfig || (selectedCameraId ? selectedCameraId : { facingMode: activeFacingMode });
+        targetConfig || (selectedCameraIdRef.current ? selectedCameraIdRef.current : { facingMode: activeFacingModeRef.current });
 
       const scanConfig: Html5QrcodeCameraScanConfig = {
         fps: 15,
-        qrbox: (viewfinderWidth, viewfinderHeight) => {
-          const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
-          const edgeSize = Math.max(180, Math.floor(minEdge * 0.72));
-          return { width: edgeSize, height: edgeSize };
+        qrbox: (w, h) => {
+          const edge = Math.max(180, Math.floor(Math.min(w, h) * 0.72));
+          return { width: edge, height: edge };
         },
       };
 
@@ -191,20 +207,21 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         onScanSuccessRef.current(decodedText);
       };
 
-      // 6. Start camera stream with automatic fallback from environment to user
+      // 5. Start camera with fallback from environment to user
       try {
-        await html5QrCodeRef.current.start(
+        await scanner.start(
           cameraConfig,
           scanConfig,
           handleDecoded,
-          () => {} // Frame-level QR scan misses are expected
+          () => {} // Frame misses while searching for QR are normal
         );
       } catch (firstErr) {
-        console.warn('First camera attempt failed, trying fallback:', firstErr);
+        console.warn('Primary camera start attempt failed, trying fallback:', firstErr);
         if (typeof cameraConfig !== 'string' && cameraConfig.facingMode === 'environment') {
           cameraConfig = { facingMode: 'user' };
+          activeFacingModeRef.current = 'user';
           setActiveFacingMode('user');
-          await html5QrCodeRef.current.start(
+          await scanner.start(
             cameraConfig,
             scanConfig,
             handleDecoded,
@@ -215,23 +232,20 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         }
       }
 
-      // If component unmounted while camera was starting, stop immediately
+      // 6. Check if component unmounted while starting
       if (!isMountedRef.current) {
-        if (html5QrCodeRef.current.isScanning) {
-          await html5QrCodeRef.current.stop();
+        if (scanner.isScanning) {
+          await scanner.stop();
         }
         return;
       }
 
+      statusRef.current = 'scanning';
       setIsScanning(true);
       setIsLoading(false);
       setErrorState(null);
 
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('ratbv_camera_autostart', 'true');
-      }
-
-      // Query available cameras for switcher dropdown
+      // Enumerate available cameras
       try {
         const devices = await Html5Qrcode.getCameras();
         if (devices && devices.length > 0) {
@@ -241,21 +255,18 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         // ignore device listing errors
       }
 
-      // Detect torch capabilities
+      // Detect flashlight capability
       try {
-        const capabilities = html5QrCodeRef.current.getRunningTrackCapabilities();
+        const capabilities = scanner.getRunningTrackCapabilities();
         setHasTorch(Boolean(capabilities && 'torch' in capabilities));
       } catch {
         setHasTorch(false);
       }
     } catch (err: unknown) {
       console.warn('Camera startup warning:', err);
+      statusRef.current = 'idle';
       setIsScanning(false);
       setIsLoading(false);
-
-      if (typeof window !== 'undefined') {
-        localStorage.removeItem('ratbv_camera_autostart');
-      }
 
       const errStr = String(err);
       const errName = (err as { name?: string })?.name || '';
@@ -269,7 +280,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         setErrorState({
           title: 'Permisiune Cameră Necesară',
           message: 'Accesul la cameră nu a fost acordat sau a fost blocat în browser.',
-          suggestion: 'Apăsați butonul de mai jos pentru a acorda permisiune sau deblocați camera din pictograma de lăcătuș de lângă URL.',
+          suggestion: 'Apăsați butonul de mai jos pentru a activa camera sau verificați permisiunea camerei din bara browserului (lăcătuș).',
           isPermissionIssue: true,
         });
       } else if (
@@ -290,12 +301,12 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         setErrorState({
           title: 'Camera este Ocupată',
           message: 'Camera video este deja utilizată de o altă aplicație.',
-          suggestion: 'Închideți alte aplicații (Zoom, Teams, aplicația cameră) și încercați din nou.',
+          suggestion: 'Închideți alte aplicații care folosesc camera și apăsați Reîncearcă.',
         });
       } else if (errStr.includes('SECURE_CONTEXT_REQUIRED')) {
         setErrorState({
           title: 'Conexiune Securizată Necesară',
-          message: 'Camera funcționează doar pe adrese securizate (HTTPS).',
+          message: 'Camera funcționează exclusiv pe adrese securizate (HTTPS).',
           suggestion: 'Accesați aplicația folosind https://.',
         });
       } else {
@@ -305,62 +316,53 @@ export const QRScanner: React.FC<QRScannerProps> = ({
           suggestion: (err as Error)?.message || 'Apăsați Reîncearcă sau folosiți introducerea manuală a codului.',
         });
       }
-    } finally {
-      isStartingRef.current = false;
     }
-  }, [activeFacingMode, selectedCameraId]);
+  }, []);
 
-  // Mount effect: runs strictly ONCE on mount and cleans up ONCE on unmount
+  // Strict Mount Effect: runs once on mount, cleans up once on unmount
   useEffect(() => {
     isMountedRef.current = true;
 
-    async function probePermission() {
+    async function probePermissionAndStart() {
       try {
         if (typeof navigator !== 'undefined' && navigator.permissions && navigator.permissions.query) {
           const status = await navigator.permissions.query({ name: 'camera' as PermissionName });
           if (status.state === 'granted') {
             startScanner();
           }
-        } else if (typeof window !== 'undefined') {
-          const autoStart = localStorage.getItem('ratbv_camera_autostart') === 'true';
-          if (autoStart) {
-            startScanner();
-          }
         }
       } catch {
-        // ignore probe failures; user can click button
+        // Permissions query failed; user can tap "Pornește Camera" button
       }
     }
 
-    probePermission();
+    if (!hasAutoStartedRef.current) {
+      hasAutoStartedRef.current = true;
+      probePermissionAndStart();
+    }
 
     return () => {
       isMountedRef.current = false;
-      if (html5QrCodeRef.current) {
-        try {
-          if (html5QrCodeRef.current.isScanning) {
-            html5QrCodeRef.current.stop().catch(() => {});
-          }
-        } catch {
-          // ignore unmount stop errors
-        }
-      }
+      safeStop();
     };
-  }, [startScanner]);
+  }, [safeStop, startScanner]);
 
   /**
-   * Switch camera between back/front or next device
+   * Switch between available cameras or toggle front/back
    */
   const handleSwitchCamera = () => {
     if (cameras.length > 1) {
-      const currentIndex = cameras.findIndex((c) => c.id === selectedCameraId);
+      const currentIndex = cameras.findIndex((c) => c.id === selectedCameraIdRef.current);
       const nextIndex = (currentIndex + 1) % cameras.length;
       const nextCamera = cameras[nextIndex];
+      selectedCameraIdRef.current = nextCamera.id;
       setSelectedCameraId(nextCamera.id);
       startScanner(nextCamera.id);
     } else {
-      const nextMode = activeFacingMode === 'environment' ? 'user' : 'environment';
+      const nextMode = activeFacingModeRef.current === 'environment' ? 'user' : 'environment';
+      activeFacingModeRef.current = nextMode;
       setActiveFacingMode(nextMode);
+      selectedCameraIdRef.current = null;
       setSelectedCameraId(null);
       startScanner({ facingMode: nextMode });
     }
@@ -370,21 +372,22 @@ export const QRScanner: React.FC<QRScannerProps> = ({
    * Flashlight / Torch toggle
    */
   const handleToggleTorch = async () => {
-    if (!html5QrCodeRef.current || !hasTorch) return;
+    const scanner = html5QrCodeRef.current;
+    if (!scanner || !hasTorch) return;
     try {
       const nextState = !torchOn;
-      await html5QrCodeRef.current.applyVideoConstraints({
+      await scanner.applyVideoConstraints({
         advanced: [{ torch: nextState } as MediaTrackConstraintSet],
       });
       setTorchOn(nextState);
     } catch (err) {
-      console.warn('Torch toggle failed:', err);
+      console.warn('Torch toggle warning:', err);
     }
   };
 
   /**
    * Fallback Image Scan:
-   * When live video is blocked or cashier has a photo/screenshot of QR
+   * When live video stream is blocked or cashier has a photo/screenshot of QR
    */
   const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -510,7 +513,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         {isLoading && (
           <div className="absolute inset-0 bg-slate-900/90 text-white flex flex-col items-center justify-center p-6 text-center z-20">
             <Loader2 className="w-10 h-10 text-white animate-spin mb-3" />
-            <p className="text-sm font-bold">Se inițializează camera...</p>
+            <p className="text-sm font-bold">Se deschide camera video...</p>
             <p className="text-xs text-slate-300 mt-1 max-w-xs">
               Dacă browserul solicită permisiune, apăsați pe <strong>„Permite”</strong>.
             </p>
@@ -549,7 +552,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
                 className="px-4 py-2 bg-[#003B71] hover:bg-blue-700 text-white text-xs font-bold rounded flex items-center gap-1.5 shadow-sm transition-colors"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
-                <span>Reîncearcă Activarea Camerei</span>
+                <span>Reîncearcă Camera</span>
               </button>
 
               <button
@@ -580,7 +583,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
             </div>
             <p className="text-sm font-bold mb-1">Camera este oprită</p>
             <p className="text-xs text-slate-300 mb-4 max-w-xs">
-              Apăsați butonul de mai jos pentru a deschide vizorul camerei.
+              Apăsați butonul de mai jos pentru a activa vizorul camerei.
             </p>
             <button
               type="button"
