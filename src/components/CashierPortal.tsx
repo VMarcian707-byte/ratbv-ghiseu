@@ -80,8 +80,13 @@ export const CashierPortal: React.FC = () => {
     document.body.removeChild(link);
   };
 
+  const isProcessingRef = React.useRef(isProcessing);
+  useEffect(() => {
+    isProcessingRef.current = isProcessing;
+  }, [isProcessing]);
+
   const handleValidateCode = useCallback(async (code: string) => {
-    if (isProcessing) return;
+    if (isProcessingRef.current) return;
     setIsProcessing(true);
 
     try {
@@ -117,7 +122,7 @@ export const CashierPortal: React.FC = () => {
     } finally {
       setIsProcessing(false);
     }
-  }, [isProcessing]);
+  }, []);
 
   const handleDismissResult = useCallback(() => {
     setActiveResult(null);

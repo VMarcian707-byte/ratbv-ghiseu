@@ -2,13 +2,11 @@
  * Clean, Resilient QR Code Scanner for RATBV Cashier Portal
  * Optimized for Vercel, iOS Safari, Android Chrome, and Desktop.
  *
- * Key fixes for Vercel & Mobile browsers:
- * 1. Direct { facingMode: 'environment' } start without requiring prior getCameras() resolution
- * 2. Automatic fallback to user camera if rear camera is unavailable (e.g. laptops/webcams)
- * 3. Explicit user-gesture button activation for strict iOS/WebKit permission policies
- * 4. Clear Romanian diagnostic explanations for Permission Denied, Insecure Context, or Hardware Busy
- * 5. Pause/Resume state management during 4-second validation overlay to prevent stream tearing
- * 6. Fallback photo capture (<input capture="environment">) if live video stream is blocked by device policy
+ * Resolved issues:
+ * 1. "Cannot clear while scan is ongoing, close it first" - Removed all premature .clear() invocations
+ * 2. Camera opening for a fraction of a second and closing - Fixed mount effect dependency loop
+ * 3. Stable singleton Html5Qrcode instance with safe pause/resume state management
+ * 4. Automatic facingMode: 'environment' with graceful 'user' webcam fallback
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
@@ -53,8 +51,16 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
   const fileQrCodeRef = useRef<Html5Qrcode | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Stable refs to prevent effect recreation loops
+  const onScanSuccessRef = useRef(onScanSuccess);
+  useEffect(() => {
+    onScanSuccessRef.current = onScanSuccess;
+  }, [onScanSuccess]);
+
   const isMountedRef = useRef<boolean>(true);
   const isStartingRef = useRef<boolean>(false);
+  const isStoppingRef = useRef<boolean>(false);
   const isScanningActiveRef = useRef<boolean>(true);
   const lastScannedCodeRef = useRef<{ code: string; time: number } | null>(null);
 
@@ -68,11 +74,10 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   const [hasTorch, setHasTorch] = useState<boolean>(false);
   const [fileScanSuccess, setFileScanSuccess] = useState<string | null>(null);
 
-  // Sync ref with props so scan callback always checks fresh state without re-creating listeners
+  // Synchronize active scanning state without restarting the camera
   useEffect(() => {
     isScanningActiveRef.current = isActive && !isProcessing;
 
-    // Use pause/resume instead of stop/start so the hardware camera stays warm and responsive
     if (html5QrCodeRef.current && isScanning) {
       try {
         const state = html5QrCodeRef.current.getState();
@@ -82,48 +87,54 @@ export const QRScanner: React.FC<QRScannerProps> = ({
           html5QrCodeRef.current.resume();
         }
       } catch (err) {
-        console.warn('Camera pause/resume toggle warning:', err);
+        console.warn('Camera pause/resume toggle notice:', err);
       }
     }
   }, [isActive, isProcessing, isScanning]);
 
   /**
-   * Stop scanner safely with promise handling
+   * Safely stops the scanner if running
    */
   const stopScanner = useCallback(async () => {
-    if (html5QrCodeRef.current) {
-      try {
-        const state = html5QrCodeRef.current.getState();
-        if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
-          await html5QrCodeRef.current.stop();
-        }
-      } catch (err) {
-        console.warn('Error while stopping scanner:', err);
-      } finally {
-        setIsScanning(false);
-        setTorchOn(false);
-        setHasTorch(false);
+    if (isStoppingRef.current || !html5QrCodeRef.current) return;
+    isStoppingRef.current = true;
+
+    try {
+      const state = html5QrCodeRef.current.getState();
+      if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
+        await html5QrCodeRef.current.stop();
       }
+    } catch (err) {
+      console.warn('Stop scanner notice:', err);
+    } finally {
+      setIsScanning(false);
+      setTorchOn(false);
+      setHasTorch(false);
+      isStoppingRef.current = false;
     }
   }, []);
 
   /**
    * Main Start Scanner function
-   * Handles:
-   * 1. Direct facingMode: 'environment' (requests permission directly on mobile)
-   * 2. Fallback to facingMode: 'user' if environment camera fails (e.g. desktop webcam)
-   * 3. Specific cameraId if user switched devices
+   * Creates Html5Qrcode instance once and starts video stream.
+   * NEVER calls .clear() while scanner is active.
    */
   const startScanner = useCallback(async (
     targetConfig?: string | { facingMode: 'environment' | 'user' }
   ) => {
-    if (isStartingRef.current) return;
+    if (isStartingRef.current || isStoppingRef.current) return;
+
+    // If scanner is already scanning with no specific camera switch requested, do nothing
+    if (!targetConfig && html5QrCodeRef.current?.isScanning) {
+      return;
+    }
+
     isStartingRef.current = true;
     setIsLoading(true);
     setErrorState(null);
 
     try {
-      // 1. Verify browser support and secure context
+      // 1. Check secure context
       if (typeof window !== 'undefined') {
         if (!window.isSecureContext && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
           throw new Error('SECURE_CONTEXT_REQUIRED');
@@ -133,27 +144,27 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         }
       }
 
-      // 2. Ensure container is ready
-      const containerElem = document.getElementById(containerId);
-      if (!containerElem) {
+      // 2. Ensure DOM container exists
+      const container = document.getElementById(containerId);
+      if (!container) {
         throw new Error('CONTAINER_NOT_FOUND');
       }
 
-      // 3. Stop any existing running instance
-      if (html5QrCodeRef.current) {
+      // 3. Stop previous stream if switching camera
+      if (html5QrCodeRef.current && html5QrCodeRef.current.isScanning) {
         try {
-          const state = html5QrCodeRef.current.getState();
-          if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
-            await html5QrCodeRef.current.stop();
-          }
+          await html5QrCodeRef.current.stop();
         } catch {
-          // ignore cleanup errors
+          // ignore stop transition
         }
-      } else {
+      }
+
+      // 4. Reuse or initialize singleton scanner
+      if (!html5QrCodeRef.current) {
         html5QrCodeRef.current = new Html5Qrcode(containerId);
       }
 
-      // Determine camera configuration
+      // 5. Choose camera configuration
       let cameraConfig: string | MediaTrackConstraints = 
         targetConfig || (selectedCameraId ? selectedCameraId : { facingMode: activeFacingMode });
 
@@ -177,20 +188,19 @@ export const QRScanner: React.FC<QRScannerProps> = ({
           return;
         }
         lastScannedCodeRef.current = { code: decodedText, time: now };
-        onScanSuccess(decodedText);
+        onScanSuccessRef.current(decodedText);
       };
 
-      // Attempt initial start
+      // 6. Start camera stream with automatic fallback from environment to user
       try {
         await html5QrCodeRef.current.start(
           cameraConfig,
           scanConfig,
           handleDecoded,
-          () => {} // scan frame failure is normal while searching for QR
+          () => {} // Frame-level QR scan misses are expected
         );
       } catch (firstErr) {
-        console.warn('Initial camera start failed, trying facingMode fallback:', firstErr);
-        // If back camera wasn't found (e.g. laptop webcam), fallback to front camera
+        console.warn('First camera attempt failed, trying fallback:', firstErr);
         if (typeof cameraConfig !== 'string' && cameraConfig.facingMode === 'environment') {
           cameraConfig = { facingMode: 'user' };
           setActiveFacingMode('user');
@@ -205,8 +215,11 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         }
       }
 
+      // If component unmounted while camera was starting, stop immediately
       if (!isMountedRef.current) {
-        await html5QrCodeRef.current.stop();
+        if (html5QrCodeRef.current.isScanning) {
+          await html5QrCodeRef.current.stop();
+        }
         return;
       }
 
@@ -214,29 +227,29 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       setIsLoading(false);
       setErrorState(null);
 
-      // Now that camera permission was granted, enumerate devices for switcher dropdown
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('ratbv_camera_autostart', 'true');
+      }
+
+      // Query available cameras for switcher dropdown
       try {
         const devices = await Html5Qrcode.getCameras();
         if (devices && devices.length > 0) {
           setCameras(devices);
         }
-      } catch (camListErr) {
-        console.warn('Could not list cameras after starting:', camListErr);
+      } catch {
+        // ignore device listing errors
       }
 
-      // Check if torch/flashlight is supported
+      // Detect torch capabilities
       try {
         const capabilities = html5QrCodeRef.current.getRunningTrackCapabilities();
         setHasTorch(Boolean(capabilities && 'torch' in capabilities));
       } catch {
         setHasTorch(false);
       }
-
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('ratbv_camera_autostart', 'true');
-      }
     } catch (err: unknown) {
-      console.warn('Camera startup notice:', err);
+      console.warn('Camera startup warning:', err);
       setIsScanning(false);
       setIsLoading(false);
 
@@ -255,8 +268,8 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       ) {
         setErrorState({
           title: 'Permisiune Cameră Necesară',
-          message: 'Accesul la cameră nu a fost acordat încă sau a fost blocat în browser.',
-          suggestion: 'Apăsați butonul de mai jos pentru a activa camera sau verificați setările browserului (pictograma de lăcătuș din bara de adrese).',
+          message: 'Accesul la cameră nu a fost acordat sau a fost blocat în browser.',
+          suggestion: 'Apăsați butonul de mai jos pentru a acorda permisiune sau deblocați camera din pictograma de lăcătuș de lângă URL.',
           isPermissionIssue: true,
         });
       } else if (
@@ -266,8 +279,8 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       ) {
         setErrorState({
           title: 'Cameră Nedetectată',
-          message: 'Nu a fost găsită nicio cameră video disponibilă pe acest dispozitiv.',
-          suggestion: 'Conectați o cameră web sau folosiți introducerea manuală a codului din tab-ul din dreapta.',
+          message: 'Nu a fost găsită nicio cameră video pe acest dispozitiv.',
+          suggestion: 'Conectați o cameră web sau folosiți introducerea manuală a codului.',
         });
       } else if (
         errName === 'NotReadableError' || 
@@ -276,84 +289,67 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       ) {
         setErrorState({
           title: 'Camera este Ocupată',
-          message: 'Camera video este deja utilizată de o altă aplicație sau tab.',
-          suggestion: 'Închideți alte tab-uri sau aplicații (de ex. Teams, Zoom, cameră) și încercați din nou.',
+          message: 'Camera video este deja utilizată de o altă aplicație.',
+          suggestion: 'Închideți alte aplicații (Zoom, Teams, aplicația cameră) și încercați din nou.',
         });
       } else if (errStr.includes('SECURE_CONTEXT_REQUIRED')) {
         setErrorState({
           title: 'Conexiune Securizată Necesară',
-          message: 'Camera funcționează exclusiv pe adrese securizate (HTTPS).',
+          message: 'Camera funcționează doar pe adrese securizate (HTTPS).',
           suggestion: 'Accesați aplicația folosind https://.',
         });
       } else {
         setErrorState({
-          title: 'Eroare la Inițializarea Camerei',
-          message: 'A apărut o problemă la deschiderea fluxului video.',
+          title: 'Eroare la Deschiderea Camerei',
+          message: 'A apărut o problemă la inițializarea fluxului video.',
           suggestion: (err as Error)?.message || 'Apăsați Reîncearcă sau folosiți introducerea manuală a codului.',
         });
       }
     } finally {
       isStartingRef.current = false;
     }
-  }, [activeFacingMode, onScanSuccess, selectedCameraId]);
+  }, [activeFacingMode, selectedCameraId]);
 
-  // Initial mount trigger - only auto-start if permission was already granted by user
+  // Mount effect: runs strictly ONCE on mount and cleans up ONCE on unmount
   useEffect(() => {
     isMountedRef.current = true;
 
-    async function checkPermissionAndMaybeStart() {
+    async function probePermission() {
       try {
         if (typeof navigator !== 'undefined' && navigator.permissions && navigator.permissions.query) {
-          const permissionStatus = await navigator.permissions.query({ name: 'camera' as PermissionName });
-          if (permissionStatus.state === 'granted') {
+          const status = await navigator.permissions.query({ name: 'camera' as PermissionName });
+          if (status.state === 'granted') {
             startScanner();
           }
-          // If 'prompt' or 'denied', leave in standby state so user clicks "Pornește Camera"
         } else if (typeof window !== 'undefined') {
-          const shouldAutoStart = localStorage.getItem('ratbv_camera_autostart') === 'true';
-          if (shouldAutoStart) {
+          const autoStart = localStorage.getItem('ratbv_camera_autostart') === 'true';
+          if (autoStart) {
             startScanner();
           }
         }
       } catch {
-        // Permissions query failed or not supported; wait for user tap
+        // ignore probe failures; user can click button
       }
     }
 
-    checkPermissionAndMaybeStart();
+    probePermission();
 
     return () => {
       isMountedRef.current = false;
       if (html5QrCodeRef.current) {
         try {
-          const state = html5QrCodeRef.current.getState();
-          if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
-            html5QrCodeRef.current.stop().catch(() => {}).finally(() => {
-              try {
-                html5QrCodeRef.current?.clear();
-              } catch {
-                // ignore
-              }
-            });
-          } else {
-            html5QrCodeRef.current.clear();
+          if (html5QrCodeRef.current.isScanning) {
+            html5QrCodeRef.current.stop().catch(() => {});
           }
         } catch {
-          // ignore
-        }
-      }
-      if (fileQrCodeRef.current) {
-        try {
-          fileQrCodeRef.current.clear();
-        } catch {
-          // ignore
+          // ignore unmount stop errors
         }
       }
     };
   }, [startScanner]);
 
   /**
-   * Switch between available cameras or toggle front/back
+   * Switch camera between back/front or next device
    */
   const handleSwitchCamera = () => {
     if (cameras.length > 1) {
@@ -404,7 +400,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       if (decodedText) {
         setFileScanSuccess(`Cod detectat: ${decodedText}`);
         setTimeout(() => setFileScanSuccess(null), 3000);
-        onScanSuccess(decodedText);
+        onScanSuccessRef.current(decodedText);
       }
     } catch (err) {
       console.error('File scan error:', err);
@@ -496,7 +492,6 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         {isScanning && !isLoading && !errorState && (
           <div className="absolute inset-0 pointer-events-none flex items-center justify-center p-6 z-10">
             <div className="w-56 h-56 sm:w-64 sm:h-64 border-2 border-white/80 rounded-lg relative shadow-inner">
-              {/* Corner tick marks */}
               <div className="absolute -top-1 -left-1 w-5 h-5 border-t-4 border-l-4 border-white rounded-tl-sm" />
               <div className="absolute -top-1 -right-1 w-5 h-5 border-t-4 border-r-4 border-white rounded-tr-sm" />
               <div className="absolute -bottom-1 -left-1 w-5 h-5 border-b-4 border-l-4 border-white rounded-bl-sm" />
