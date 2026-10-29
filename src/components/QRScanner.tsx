@@ -17,7 +17,8 @@ import {
   Html5Qrcode, 
   Html5QrcodeCameraScanConfig, 
   CameraDevice, 
-  Html5QrcodeScannerState 
+  Html5QrcodeScannerState,
+  Html5QrcodeSupportedFormats
 } from 'html5-qrcode';
 import { 
   Camera, 
@@ -182,18 +183,33 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       }
       container.innerHTML = '';
 
-      // 4. Create fresh instance in NOT_STARTED state (guarantees clearElement won't throw)
-      const scanner = new Html5Qrcode(containerId);
+      // 4. Create fresh instance with native hardware BarcodeDetector enabled
+      const scanner = new Html5Qrcode(containerId, {
+        useBarCodeDetectorIfSupported: true,
+        experimentalFeatures: {
+          useBarCodeDetectorIfSupported: true,
+        },
+        formatsToSupport: [
+          Html5QrcodeSupportedFormats.QR_CODE,
+          Html5QrcodeSupportedFormats.DATA_MATRIX,
+          Html5QrcodeSupportedFormats.AZTEC,
+        ],
+        verbose: false,
+      });
       html5QrCodeRef.current = scanner;
 
       let cameraConfig: string | MediaTrackConstraints = 
         targetConfig || (selectedCameraIdRef.current ? selectedCameraIdRef.current : { facingMode: activeFacingModeRef.current });
 
+      // Scan full frame (NO qrbox crop) so QR codes at any distance or angle are detected instantly!
       const scanConfig: Html5QrcodeCameraScanConfig = {
-        fps: 15,
-        qrbox: (w, h) => {
-          const edge = Math.max(180, Math.floor(Math.min(w, h) * 0.72));
-          return { width: edge, height: edge };
+        fps: 24,
+        disableFlip: false,
+        videoConstraints: {
+          facingMode: isMobile ? { ideal: 'environment' } : { ideal: 'user' },
+          width: { ideal: 1920, min: 640 },
+          height: { ideal: 1080, min: 480 },
+          advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet],
         },
       };
 
@@ -207,6 +223,12 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         ) {
           return;
         }
+
+        // Haptic feedback
+        if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+          navigator.vibrate([60, 40, 80]);
+        }
+
         lastScannedCodeRef.current = { code: decodedText, time: now };
         onScanSuccessRef.current(decodedText);
       };
@@ -495,18 +517,22 @@ export const QRScanner: React.FC<QRScannerProps> = ({
         {/* DOM element where html5-qrcode attaches video stream */}
         <div id={containerId} className="w-full h-full relative" />
 
-        {/* Clean Static Targeting Frame */}
+        {/* Clean Static Targeting Frame with subtle active scan indicator */}
         {isScanning && !isLoading && !errorState && (
-          <div className="absolute inset-0 pointer-events-none flex items-center justify-center p-6 z-10">
-            <div className="w-56 h-56 sm:w-64 sm:h-64 border-2 border-white/80 rounded-lg relative shadow-inner">
-              <div className="absolute -top-1 -left-1 w-5 h-5 border-t-4 border-l-4 border-white rounded-tl-sm" />
-              <div className="absolute -top-1 -right-1 w-5 h-5 border-t-4 border-r-4 border-white rounded-tr-sm" />
-              <div className="absolute -bottom-1 -left-1 w-5 h-5 border-b-4 border-l-4 border-white rounded-bl-sm" />
-              <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-4 border-r-4 border-white rounded-br-sm" />
+          <div className="absolute inset-0 pointer-events-none flex items-center justify-center p-4 z-10">
+            <div className="w-64 h-64 sm:w-80 sm:h-80 max-w-[85%] max-h-[85%] border-2 border-white/60 rounded-xl relative shadow-2xl overflow-hidden">
+              {/* Corner tick marks */}
+              <div className="absolute -top-1 -left-1 w-6 h-6 border-t-4 border-l-4 border-emerald-400 rounded-tl-md" />
+              <div className="absolute -top-1 -right-1 w-6 h-6 border-t-4 border-r-4 border-emerald-400 rounded-tr-md" />
+              <div className="absolute -bottom-1 -left-1 w-6 h-6 border-b-4 border-l-4 border-emerald-400 rounded-bl-md" />
+              <div className="absolute -bottom-1 -right-1 w-6 h-6 border-b-4 border-r-4 border-emerald-400 rounded-br-md" />
+
+              {/* Animated subtle scan guide line */}
+              <div className="absolute inset-x-0 h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent animate-pulse top-1/2 -translate-y-1/2" />
               
               <div className="absolute inset-x-0 bottom-2 text-center">
-                <span className="bg-black/60 text-white text-[10px] font-bold px-2 py-0.5 rounded tracking-wide uppercase">
-                  Cadrați Codul QR
+                <span className="bg-black/75 text-emerald-300 text-[10px] font-bold px-2.5 py-1 rounded-full tracking-wider uppercase border border-emerald-500/30">
+                  Scanare Activă
                 </span>
               </div>
             </div>
@@ -633,14 +659,14 @@ export const QRScanner: React.FC<QRScannerProps> = ({
       </div>
 
       {/* Subtext info */}
-      <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs text-slate-600">
-        <span>Îndreptați ecranul telefonului călătorului spre obiectiv.</span>
+      <div className="p-3 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-600">
+        <span>💡 <strong>Sfat:</strong> Țineți telefonul la 15–25 cm de ecran/bilet pentru focalizare optimă.</span>
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          className="text-[#003B71] hover:underline font-semibold"
+          className="text-[#003B71] hover:underline font-bold text-left sm:text-right"
         >
-          Sau încarcă fișier
+          Sau încarcă poză / fișier
         </button>
       </div>
     </div>
