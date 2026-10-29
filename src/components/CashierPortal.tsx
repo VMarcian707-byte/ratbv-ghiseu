@@ -228,7 +228,7 @@ export const CashierPortal: React.FC = () => {
                   <th className="py-2.5 px-4">Ora</th>
                   <th className="py-2.5 px-4">Cod QR</th>
                   <th className="py-2.5 px-4">Status / Rezultat</th>
-                  <th className="py-2.5 px-4">Telefon Călător</th>
+                  
                   <th className="py-2.5 px-4 text-right">Bilete Acordate</th>
                 </tr>
               </thead>
@@ -273,9 +273,7 @@ export const CashierPortal: React.FC = () => {
                             </span>
                           )}
                         </td>
-                        <td className="py-2.5 px-4 font-mono text-slate-700">
-                          {item.phone || '–'}
-                        </td>
+                        
                         <td className="py-2.5 px-4 text-right font-bold text-slate-900">
                           {isValid ? '+3 Bilete' : '0'}
                         </td>
