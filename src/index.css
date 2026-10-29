@@ -21,16 +21,25 @@
 /* Ensure clean video rendering inside html5-qrcode container */
 #qr-reader-container {
   width: 100% !important;
+  height: 100% !important;
   border: none !important;
   background-color: #000000 !important;
+  position: relative !important;
 }
 
 #qr-reader-container video {
   width: 100% !important;
   height: 100% !important;
   object-fit: cover !important;
+  display: block !important;
 }
 
 #qr-reader-container__scan_region {
+  width: 100% !important;
+  height: 100% !important;
   background: transparent !important;
+}
+
+#qr-reader-container__header_message {
+  display: none !important;
 }
