@@ -64,8 +64,12 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   const isScanningActiveRef = useRef<boolean>(true);
   const lastScannedCodeRef = useRef<{ code: string; time: number } | null>(null);
 
+  // Detect mobile vs desktop to choose optimal default camera
+  const isMobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const initialFacingMode: 'environment' | 'user' = isMobile ? 'environment' : 'user';
+
   // Active camera settings in refs to avoid recreating callbacks
-  const activeFacingModeRef = useRef<'environment' | 'user'>('environment');
+  const activeFacingModeRef = useRef<'environment' | 'user'>(initialFacingMode);
   const selectedCameraIdRef = useRef<string | null>(null);
 
   // Stable callback ref
@@ -77,7 +81,7 @@ export const QRScanner: React.FC<QRScannerProps> = ({
   // UI state
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
-  const [activeFacingMode, setActiveFacingMode] = useState<'environment' | 'user'>('environment');
+  const [activeFacingMode, setActiveFacingMode] = useState<'environment' | 'user'>(initialFacingMode);
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorState, setErrorState] = useState<ErrorDetails | null>(null);
@@ -539,11 +543,31 @@ export const QRScanner: React.FC<QRScannerProps> = ({
               {errorState.message}
             </p>
 
-            <div className="bg-slate-800/80 border border-slate-700 rounded p-3 mb-4 text-left max-w-sm">
-              <p className="text-[11px] text-slate-300 leading-relaxed">
-                💡 <strong>Recomandare:</strong> {errorState.suggestion}
-              </p>
-            </div>
+            {errorState.isPermissionIssue ? (
+              <div className="w-full max-w-sm bg-amber-500/10 border border-amber-500/40 rounded-lg p-3.5 mb-4 text-left">
+                <div className="flex items-center gap-2 text-amber-300 font-bold text-xs mb-2">
+                  <Lock className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Deblocare Cameră în Browser (Edge / Chrome):</span>
+                </div>
+                <ol className="text-[11px] text-amber-100/90 space-y-1.5 list-decimal list-inside leading-relaxed">
+                  <li>
+                    Faceți clic pe pictograma <strong>🔒 (lăcătuș)</strong> din stânga adresei web din browser (lângă <em>vercel.app</em>).
+                  </li>
+                  <li>
+                    La opțiunea <strong>„Cameră” (Camera)</strong>, comutați din „Blocat” în <strong>„Permite” (Allow)</strong>.
+                  </li>
+                  <li>
+                    Apăsați butonul <strong>„Reîncearcă Camera”</strong> sau <strong>„Reîncarcă Pagina”</strong>.
+                  </li>
+                </ol>
+              </div>
+            ) : (
+              <div className="bg-slate-800/80 border border-slate-700 rounded p-3 mb-4 text-left max-w-sm">
+                <p className="text-[11px] text-slate-300 leading-relaxed">
+                  💡 <strong>Recomandare:</strong> {errorState.suggestion}
+                </p>
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center justify-center gap-2">
               <button
@@ -554,6 +578,17 @@ export const QRScanner: React.FC<QRScannerProps> = ({
                 <RefreshCw className="w-3.5 h-3.5" />
                 <span>Reîncearcă Camera</span>
               </button>
+
+              {errorState.isPermissionIssue && (
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold rounded flex items-center gap-1.5 shadow-sm transition-colors"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Reîncarcă Pagina</span>
+                </button>
+              )}
 
               <button
                 type="button"
